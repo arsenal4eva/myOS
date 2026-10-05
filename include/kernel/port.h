@@ -1,4 +1,3 @@
-/* SnackOS - low-level port I/O + core types */
 #ifndef _KERNEL_PORT_H
 #define _KERNEL_PORT_H
 

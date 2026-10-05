@@ -86,8 +86,7 @@ static void read_line(char *buf, size_t cap) {
 }
 
 
-static int tokenize(char *line, char bufs[MAX_ARGS][MAX_TOK], char *argv[MAX_ARGS],
-                    int quoted[MAX_ARGS]) {
+static int tokenize(char *line, char bufs[MAX_ARGS][MAX_TOK], char *argv[MAX_ARGS], int quoted[MAX_ARGS]) {
     int argc = 0;
     char *p = line;
     while (*p) {
@@ -200,8 +199,7 @@ static int parse_redir(int argc, char **argv, int *quoted, char *argv2[MAX_ARGS]
 }
 
 
-static int glob_expand(int argc, char **argv, int *quoted, char bufs[MAX_ARGS][MAX_TOK],
-                       char *out[MAX_ARGS]) {
+static int glob_expand(int argc, char **argv, int *quoted, char bufs[MAX_ARGS][MAX_TOK], char *out[MAX_ARGS]) {
     int n = 0;
     char name[FS_MAX_NAME + 1];
     for (int i = 0; i < argc; i++) {
@@ -249,10 +247,76 @@ static void print_with_nl(const char *s) {
         kprintf("\n");
 }
 
+/* Parse 1-based line number: all digits, value >= 1. Returns 1 on success. */
+static int parse_lineno(const char *s, int *out) {
+    if (!s || !*s)
+        return 0;
+    int v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return 0;
+        v = v * 10 + (*p - '0');
+        if (v > 1000000)
+            return 0;
+    }
+    if (v < 1)
+        return 0;
+    *out = v;
+    return 1;
+}
+
+/* Count lines: '\n' count + 1 if trailing partial line. Empty = 0 lines. */
+static int count_lines(const char *buf, int n) {
+    if (n <= 0)
+        return 0;
+    int nl = 0;
+    for (int i = 0; i < n; i++)
+        if (buf[i] == '\n')
+            nl++;
+    if (buf[n - 1] != '\n')
+        nl++;
+    return nl;
+}
+
+/* Print lines [start, end] (1-based, inclusive, end==0 means EOF)
+ * of NUL-terminated text of length n.
+ * Returns lines printed; total_out gets total line count. */
+static int print_lines_range(const char *buf, int n, int start, int end, int *total_out) {
+    int total = count_lines(buf, n);
+    if (total_out)
+        *total_out = total;
+    if (n <= 0 || start > total)
+        return 0;
+    if (end == 0 || end > total)
+        end = total;
+    int line = 1;
+    int i = 0;
+    int printed = 0;
+    while (i < n) {
+        int ls = i;
+        while (i < n && buf[i] != '\n')
+            i++;
+        int has_nl = (i < n && buf[i] == '\n');
+        int le = i + (has_nl ? 1 : 0); /* include newline */
+        if (line >= start && line <= end) {
+            for (int j = ls; j < le; j++)
+                tty_putchar(buf[j]);
+            printed++;
+        }
+        if (line >= end)
+            break;
+        if (has_nl)
+            i++;
+        line++;
+    }
+    return printed;
+}
+
 static void cmd_ls_list_top(void) {
     int total = fs_num_entries();
     int printn = 0;
     char name[FS_MAX_NAME + 1];
+    static char lbuf[INPUT_SIZE];
     for (int e = 0; e < total; e++) {
         int is_dir = 0;
         size_t sz = 0;
@@ -262,8 +326,11 @@ static void cmd_ls_list_top(void) {
             continue;
         if (is_dir)
             kprintf("%s/\n", name);
-        else
-            kprintf("%s (%u bytes)\n", name, (unsigned)sz);
+        else {
+            int n = fs_read(name, lbuf, sizeof(lbuf));
+            int lines = (n > 0) ? count_lines(lbuf, n) : 0;
+            kprintf("%s (%d lines, %u chars)\n", name, lines, (unsigned)sz);
+        }
         printn = 1;
     }
     if (!printn)
@@ -280,6 +347,7 @@ static void cmd_ls_list_dir(const char *dir) {
     int total = fs_num_entries();
     int printn = 0;
     char name[FS_MAX_NAME + 1];
+    static char lbuf[INPUT_SIZE];
     for (int e = 0; e < total; e++) {
         int is_dir = 0;
         size_t sz = 0;
@@ -292,8 +360,11 @@ static void cmd_ls_list_dir(const char *dir) {
             continue; 
         if (is_dir)
             kprintf("%s/\n", rem);
-        else
-            kprintf("%s (%u bytes)\n", rem, (unsigned)sz);
+        else {
+            int n = fs_read(name, lbuf, sizeof(lbuf));
+            int lines = (n > 0) ? count_lines(lbuf, n) : 0;
+            kprintf("%s (%d lines, %u chars)\n", rem, lines, (unsigned)sz);
+        }
         printn = 1;
     }
     if (!printn)
@@ -316,7 +387,10 @@ static void cmd_ls(int argc, char **argv) {
             cmd_ls_list_dir(argv[i]);
         } else if (fs_exists(argv[i])) {
             size_t sz = fs_size(argv[i]);
-            kprintf("%s (%u bytes)\n", argv[i], (unsigned)sz);
+            static char lbuf[INPUT_SIZE];
+            int n = fs_read(argv[i], lbuf, sizeof(lbuf));
+            int lines = (n > 0) ? count_lines(lbuf, n) : 0;
+            kprintf("%s (%d lines, %u chars)\n", argv[i], lines, (unsigned)sz);
         } else {
             kprintf("list: '%s': no such file or directory\n", argv[i]);
         }
@@ -325,15 +399,56 @@ static void cmd_ls(int argc, char **argv) {
 
 static void cmd_cat(int argc, char **argv, const char *in_data, int in_present) {
     static char buf[INPUT_SIZE];
-    if (argc == 1) {
+    /* Optional trailing line range: print <file...> [start [end]].
+     * - print f.txt 5 8  -> lines 5-8 of f.txt
+     * - print f.txt 5    -> line 5 only
+     * - print < f.txt 5 8 works too (range applies to stdin). */
+    int start = 1, end = 0, have_range = 0;
+    int nargs = argc;
+    if (nargs > 1) {
+        int a = 0, b = 0;
+        if (nargs >= 4 && parse_lineno(argv[nargs - 2], &a) &&
+            parse_lineno(argv[nargs - 1], &b)) {
+            /* Need at least one file arg (or stdin) before the numbers. */
+            if (nargs > 3 || in_present) {
+                start = a;
+                end = b;
+                nargs -= 2;
+                have_range = 1;
+            }
+        } else if (nargs >= 3 && parse_lineno(argv[nargs - 1], &a)) {
+            if (nargs > 2 || in_present) {
+                start = a;
+                end = a; /* single number = that line only */
+                nargs -= 1;
+                have_range = 1;
+            }
+        }
+        if (have_range && end != 0 && end < start) {
+            kprintf("print: invalid range %d-%d (end < start)\n", start, end);
+            return;
+        }
+    }
+    if (nargs == 1) {
         if (in_present) {
-            print_with_nl(in_data);
+            if (have_range) {
+                int total = 0;
+                int got = print_lines_range(in_data, strlen(in_data), start, end, &total);
+                if (got == 0) {
+                    if (end == start)
+                        kprintf("print: no line %d (input has %d lines)\n", start, total);
+                    else
+                        kprintf("print: no lines %d-%d (input has %d lines)\n", start, end, total);
+                }
+            } else
+                print_with_nl(in_data);
         } else {
-            kprintf("usage: print <file...>  (try 'list', glob '*.txt', or 'print < file')\n");
+            kprintf("usage: print <file...> [start [end]]\n");
+            kprintf("  e.g. print f.txt 5 8  (lines 5-8)\n");
         }
         return;
     }
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < nargs; i++) {
         if (has_glob(argv[i])) {
             kprintf("print: no matches: '%s'\n", argv[i]);
             continue;
@@ -347,9 +462,20 @@ static void cmd_cat(int argc, char **argv, const char *in_data, int in_present) 
             kprintf("print: '%s': no such file\n", argv[i]);
             continue;
         }
-        kprintf("%s", buf);
-        if (n > 0 && buf[n - 1] != '\n')
-            kprintf("\n");
+        if (have_range) {
+            int total = 0;
+            int got = print_lines_range(buf, n, start, end, &total);
+            if (got == 0) {
+                if (end == start)
+                    kprintf("print: '%s': no line %d (file has %d lines)\n", argv[i], start, total);
+                else
+                    kprintf("print: '%s': no lines %d-%d (file has %d lines)\n", argv[i], start, end, total);
+            }
+        } else {
+            kprintf("%s", buf);
+            if (n > 0 && buf[n - 1] != '\n')
+                kprintf("\n");
+        }
     }
 }
 
@@ -359,8 +485,8 @@ static void cmd_help(void) {
     kprintf(" General: help sysinfo man echo clear ticks beep\n\n");
     kprintf(" Files: create mkdir list print remove\n\n");
     kprintf(" Redirection: echo hello > f.txt | echo more >> f.txt | print < f.txt\n\n");
-    kprintf(" Globbing: * matches any run, ? matches one char  (e.g. list *.txt)\n\n");
-    kprintf(" Chaining: cmd1 ; cmd2 ; cmd3  (e.g. echo hi ; ticks)\n\n");
+    kprintf(" Globbing: * matches any run, ? matches one char\n\n");
+    kprintf(" Chaining: cmd1 ; cmd2 ; cmd3\n\n");
 }
 
 static void man_overview(void) {
@@ -377,26 +503,22 @@ static void man_for(const char *topic) {
         kprintf("SYNOPSIS: help\n");
         kprintf("DESC: Lists commands, redir, glob, chain hints.\n");
         kprintf("EXAMPLE: help\n");
-        kprintf("SEE ALSO: man <cmd> for details\n");
     } else if (!strcmp(topic, "sysinfo")) {
         kprintf("SYSINFO - system information\n\n");
         kprintf("SYNOPSIS: sysinfo\n");
         kprintf("DESC: Prints OS, CPU, memory, uptime (like fastfetch).\n");
         kprintf("EXAMPLE: sysinfo | sysinfo > info.txt\n");
-        kprintf("SEE ALSO: man ticks\n");
     } else if (!strcmp(topic, "man")) {
         kprintf("MAN - read manuals\n\n");
         kprintf("SYNOPSIS: man [command|topic]\n");
         kprintf("DESC: No args lists topics. With arg shows that page.\n");
         kprintf("EXAMPLES: man | man echo | man redirection\n");
-        kprintf("SEE ALSO: help\n");
     } else if (!strcmp(topic, "echo")) {
         kprintf("ECHO - print text\n\n");
         kprintf("SYNOPSIS: echo [text...] | echo < file\n");
         kprintf("DESC: Prints args joined by spaces. Bare echo prints\n");
         kprintf("  blank line; with '< file' prints file (stdin redir).\n");
         kprintf("EXAMPLES: echo hi | echo hi > a.txt | echo \"*\"\n");
-        kprintf("SEE ALSO: man redirection\n");
     } else if (!strcmp(topic, "clear")) {
         kprintf("CLEAR - clear screen\n\n");
         kprintf("SYNOPSIS: clear\n");
@@ -407,7 +529,6 @@ static void man_for(const char *topic) {
         kprintf("SYNOPSIS: ticks\n");
         kprintf("DESC: Prints PIT ticks since boot (100 ticks = 1 sec).\n");
         kprintf("EXAMPLE: ticks\n");
-        kprintf("SEE ALSO: sysinfo\n");
     } else if (!strcmp(topic, "beep")) {
         kprintf("BEEP - PC speaker beep\n\n");
         kprintf("SYNOPSIS: beep\n");
@@ -419,33 +540,32 @@ static void man_for(const char *topic) {
         kprintf("DESC: Creates empty file(s). Existing files kept.\n");
         kprintf("  Dirs error if path is a directory.\n");
         kprintf("EXAMPLE: create hi.txt ; echo hi > hi.txt\n");
-        kprintf("SEE ALSO: mkdir list print remove\n");
     } else if (!strcmp(topic, "mkdir")) {
         kprintf("MKDIR(1) - make directories\n");
         kprintf("SYNOPSIS: mkdir <dir...>\n");
         kprintf("DESC: Creates dir(s). Use paths like docs/ or a/b.\n");
         kprintf("EXAMPLE: mkdir docs ; list\n");
-        kprintf("SEE ALSO: create list remove\n");
     } else if (!strcmp(topic, "list") || !strcmp(topic, "ls")) {
         kprintf("LIST(1) - list files\n");
         kprintf("SYNOPSIS: list [path...]  (bare list = top level)\n");
         kprintf("DESC: Lists files or dir contents. Globs expand before\n");
         kprintf("  lookup; unmatched glob prints 'no matches'.\n");
         kprintf("EXAMPLES: list | list docs | list *.txt\n");
-        kprintf("SEE ALSO: print remove\n");
     } else if (!strcmp(topic, "print") || !strcmp(topic, "cat")) {
         kprintf("PRINT(1) - print files\n");
-        kprintf("SYNOPSIS: print <file...> | print < file\n");
+        kprintf("SYNOPSIS: print <file...> [start [end]] | print < file\n");
         kprintf("DESC: Prints file(s). Bare print shows usage; dirs\n");
         kprintf("  error; missing files error per file.\n");
+        kprintf("  start/end are 1-based line numbers: 'print a.txt\n");
+        kprintf("  5 8' prints lines 5-8, 'print a.txt 5' prints\n");
+        kprintf("  line 5 only.\n");
         kprintf("EXAMPLES: print a.txt | print *.txt | print < a.txt\n");
-        kprintf("SEE ALSO: list man redirection\n");
+        kprintf("  print a.txt 5 8 | print a.txt 5\n");
     } else if (!strcmp(topic, "remove") || !strcmp(topic, "rm")) {
         kprintf("REMOVE(1) - delete files\n");
         kprintf("SYNOPSIS: remove <path...>\n");
         kprintf("DESC: Deletes files/dirs. Dirs must be empty.\n");
         kprintf("EXAMPLES: remove a.txt | remove *.log\n");
-        kprintf("SEE ALSO: create mkdir list\n");
     } else if (!strcmp(topic, "redirection") || !strcmp(topic, "redir") ||
                !strcmp(topic, ">") || !strcmp(topic, "redirect")) {
         kprintf("REDIRECTION - file redirect (< > >>)\n");
