@@ -40,3 +40,4 @@ Chained: `create hi.txt ; echo hello > hi.txt ; print hi.txt ; list *.txt`.
 ## AI was used
 
 I tried to keep AI usage to a minimum, eg. debugging, translating
+AI was also used to fix commit and pushing conflicts
