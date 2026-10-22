@@ -60,4 +60,18 @@ void tty_setcursor(size_t r, size_t c) {
 void tty_hidecursor(void) {
     outb(0x3D4, 0x0A); outb(0x3D5, 0x20);
 }
-void tty_showcursor(void) { update_cursor(); }
+void tty_showcursor(void) {
+    outb(0x3D4, 0x0A); outb(0x3D5, 0x0E);
+    outb(0x3D4, 0x0B); outb(0x3D5, 0x0F);
+    update_cursor();
+}
+void tty_clear_row(size_t r) {
+    if (r >= VGA_H) return;
+    for (size_t x = 0; x < VGA_W; x++)
+        VGA_BUF[r*VGA_W+x] = (uint16_t)(' ' | (color << 8));
+}
+void tty_write_at(size_t r, size_t c, const char *s, size_t n) {
+    if (r >= VGA_H) return;
+    for (size_t i = 0; i < n && c + i < VGA_W; i++)
+        VGA_BUF[r*VGA_W+c+i] = (uint16_t)((uint8_t)s[i] | (color << 8));
+}

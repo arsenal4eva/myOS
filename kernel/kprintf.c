@@ -20,7 +20,6 @@ static void out(char c) {
     if (cap_buf) {
         if (cap_pos + 1 < cap_size)
             cap_buf[cap_pos++] = c;
-        /* else: drop (caller can detect truncation: len+1 == cap) */
         return;
     }
     tty_putchar(c); serial_putchar(c);

@@ -1,4 +1,3 @@
-/* SnackOS - Multiboot info (subset of the Multiboot1 spec) */
 #ifndef _KERNEL_MULTIBOOT_H
 #define _KERNEL_MULTIBOOT_H
 
@@ -10,7 +9,7 @@ typedef struct multiboot_mmap_entry {
     uint32_t size;
     uint64_t addr;
     uint64_t len;
-    uint32_t type; /* 1 = usable RAM, 2 = reserved, ... */
+    uint32_t type; 
 } __attribute__((packed)) multiboot_mmap_entry_t;
 
 typedef struct multiboot_info {
@@ -24,7 +23,6 @@ typedef struct multiboot_info {
     uint32_t syms[4];
     uint32_t mmap_length;
     uint32_t mmap_addr;
-    /* ... rest ignored */
 } multiboot_info_t;
 
 #endif

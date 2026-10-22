@@ -12,4 +12,6 @@ void tty_getcursor(size_t *row_out, size_t *col_out);
 void tty_setcursor(size_t row, size_t col);
 void tty_hidecursor(void);
 void tty_showcursor(void);
+void tty_clear_row(size_t r);
+void tty_write_at(size_t r, size_t c, const char *s, size_t n);
 #endif

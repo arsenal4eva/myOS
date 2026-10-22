@@ -22,8 +22,6 @@ void fs_init(void) {
     memset(fs_tab, 0, sizeof(fs_tab));
 }
 
-/* Normalize: strip leading '/'s and trailing '/'s (caller tells us if dir).
- * Returns 0 on ok, -1 on bad name. Out always NUL-terminated. */
 static int normalize(const char *path, char *out, size_t cap) {
     if (!path || !out || cap == 0)
         return -1;
@@ -38,13 +36,11 @@ static int normalize(const char *path, char *out, size_t cap) {
         return -1;
     memcpy(out, path, n);
     out[n] = 0;
-    /* reject empty components ("//"), "." / ".." segments */
     if (strstr_wrap(out))
         return -1;
     return 0;
 }
 
-/* Small local helpers (avoid growing string.c for now). */
 static int has_substr(const char *s, const char *sub) {
     size_t ls = strlen(s), lb = strlen(sub);
     if (lb == 0 || lb > ls)
@@ -59,11 +55,9 @@ static int has_substr(const char *s, const char *sub) {
     return 0;
 }
 
-/* reject "//" anywhere and any "." / ".." path segment */
 static int strstr_wrap(const char *p) {
     if (has_substr(p, "//"))
         return 1;
-    /* walk segments */
     const char *s = p;
     while (*s) {
         const char *e = s;
@@ -93,7 +87,6 @@ static int free_slot(void) {
     return -1;
 }
 
-/* true if `prefix` is a parent dir of `path` ("docs" vs "docs/a.txt") */
 static int is_child_of(const char *path, const char *prefix) {
     size_t lp = strlen(prefix);
     if (strncmp(path, prefix, lp) != 0)
@@ -106,7 +99,7 @@ int fs_create(const char *path) {
     if (normalize(path, norm, sizeof(norm)) != 0)
         return -1;
     if (find_slot(norm) >= 0)
-        return -1; /* exists (touch on existing file is ok at shell level) */
+        return -1; 
     int s = free_slot();
     if (s < 0)
         return -1;
@@ -182,7 +175,6 @@ int fs_write(const char *path, const char *data, size_t len, int append) {
     if (base + len > FS_MAX_FILE)
         return -1;
     if (base + len == 0) {
-        /* truncate to empty: keep buffer, just reset size */
         fs_tab[s].size = 0;
         return 0;
     }
@@ -199,7 +191,6 @@ int fs_write(const char *path, const char *data, size_t len, int append) {
         fs_tab[s].cap = ncap;
     }
     if (!append) {
-        /* truncate: logical size reset, buffer reused */
         fs_tab[s].size = 0;
         base = 0;
     }
@@ -220,7 +211,7 @@ int fs_read(const char *path, char *buf, size_t cap) {
         return -1;
     size_t n = fs_tab[s].size;
     if (n + 1 > cap)
-        n = cap - 1; /* truncate, still NUL-terminate */
+        n = cap - 1; 
     if (n && fs_tab[s].data)
         memcpy(buf, fs_tab[s].data, n);
     buf[n] = 0;
@@ -237,7 +228,7 @@ int fs_delete(const char *path) {
     if (fs_tab[s].is_dir) {
         for (int i = 0; i < FS_MAX_ENTRIES; i++) {
             if (fs_tab[i].in_use && is_child_of(fs_tab[i].name, norm))
-                return -1; /* not empty */
+                return -1; 
         }
     }
     if (fs_tab[s].data)
@@ -258,8 +249,7 @@ int fs_num_entries(void) {
     return n;
 }
 
-int fs_get_entry(int idx, char *name_out, size_t name_cap,
-                 int *is_dir_out, size_t *size_out) {
+int fs_get_entry(int idx, char *name_out, size_t name_cap, int *is_dir_out, size_t *size_out) {
     int cur = 0;
     for (int i = 0; i < FS_MAX_ENTRIES; i++) {
         if (!fs_tab[i].in_use)
@@ -280,7 +270,6 @@ int fs_get_entry(int idx, char *name_out, size_t name_cap,
     return -1;
 }
 
-/* Glob: '*' matches any (possibly empty) run, '?' matches exactly one char. */
 int fs_match(const char *pattern, const char *str) {
     const char *p = pattern, *s = str;
     const char *star = 0, *ss = 0;

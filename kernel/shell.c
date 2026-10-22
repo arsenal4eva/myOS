@@ -8,6 +8,7 @@
 #include "kernel/sysinfo.h"
 #include "kernel/port.h"
 #include "kernel/fs.h"
+#include "kernel/editor.h"
 
 #define MAX_ARGS 32
 #define MAX_TOK 64
@@ -86,8 +87,7 @@ static void read_line(char *buf, size_t cap) {
 }
 
 
-static int tokenize(char *line, char bufs[MAX_ARGS][MAX_TOK], char *argv[MAX_ARGS],
-                    int quoted[MAX_ARGS]) {
+static int tokenize(char *line, char bufs[MAX_ARGS][MAX_TOK], char *argv[MAX_ARGS], int quoted[MAX_ARGS]) {
     int argc = 0;
     char *p = line;
     while (*p) {
@@ -200,8 +200,7 @@ static int parse_redir(int argc, char **argv, int *quoted, char *argv2[MAX_ARGS]
 }
 
 
-static int glob_expand(int argc, char **argv, int *quoted, char bufs[MAX_ARGS][MAX_TOK],
-                       char *out[MAX_ARGS]) {
+static int glob_expand(int argc, char **argv, int *quoted, char bufs[MAX_ARGS][MAX_TOK], char *out[MAX_ARGS]) {
     int n = 0;
     char name[FS_MAX_NAME + 1];
     for (int i = 0; i < argc; i++) {
@@ -249,10 +248,71 @@ static void print_with_nl(const char *s) {
         kprintf("\n");
 }
 
+static int parse_lineno(const char *s, int *out) {
+    if (!s || !*s)
+        return 0;
+    int v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return 0;
+        v = v * 10 + (*p - '0');
+        if (v > 1000000)
+            return 0;
+    }
+    if (v < 1)
+        return 0;
+    *out = v;
+    return 1;
+}
+
+static int count_lines(const char *buf, int n) {
+    if (n <= 0)
+        return 0;
+    int nl = 0;
+    for (int i = 0; i < n; i++)
+        if (buf[i] == '\n')
+            nl++;
+    if (buf[n - 1] != '\n')
+        nl++;
+    return nl;
+}
+
+static int print_lines_range(const char *buf, int n, int start, int end, int *total_out) {
+    int total = count_lines(buf, n);
+    if (total_out)
+        *total_out = total;
+    if (n <= 0 || start > total)
+        return 0;
+    if (end == 0 || end > total)
+        end = total;
+    int line = 1;
+    int i = 0;
+    int printed = 0;
+    while (i < n) {
+        int ls = i;
+        while (i < n && buf[i] != '\n')
+            i++;
+        int has_nl = (i < n && buf[i] == '\n');
+        int le = i + (has_nl ? 1 : 0); 
+        if (line >= start && line <= end) {
+            for (int j = ls; j < le; j++)
+                tty_putchar(buf[j]);
+            printed++;
+        }
+        if (line >= end)
+            break;
+        if (has_nl)
+            i++;
+        line++;
+    }
+    return printed;
+}
+
 static void cmd_ls_list_top(void) {
     int total = fs_num_entries();
     int printn = 0;
     char name[FS_MAX_NAME + 1];
+    static char lbuf[INPUT_SIZE];
     for (int e = 0; e < total; e++) {
         int is_dir = 0;
         size_t sz = 0;
@@ -262,8 +322,11 @@ static void cmd_ls_list_top(void) {
             continue;
         if (is_dir)
             kprintf("%s/\n", name);
-        else
-            kprintf("%s (%u bytes)\n", name, (unsigned)sz);
+        else {
+            int n = fs_read(name, lbuf, sizeof(lbuf));
+            int lines = (n > 0) ? count_lines(lbuf, n) : 0;
+            kprintf("%s (%d lines, %u chars)\n", name, lines, (unsigned)sz);
+        }
         printn = 1;
     }
     if (!printn)
@@ -280,6 +343,7 @@ static void cmd_ls_list_dir(const char *dir) {
     int total = fs_num_entries();
     int printn = 0;
     char name[FS_MAX_NAME + 1];
+    static char lbuf[INPUT_SIZE];
     for (int e = 0; e < total; e++) {
         int is_dir = 0;
         size_t sz = 0;
@@ -292,8 +356,11 @@ static void cmd_ls_list_dir(const char *dir) {
             continue; 
         if (is_dir)
             kprintf("%s/\n", rem);
-        else
-            kprintf("%s (%u bytes)\n", rem, (unsigned)sz);
+        else {
+            int n = fs_read(name, lbuf, sizeof(lbuf));
+            int lines = (n > 0) ? count_lines(lbuf, n) : 0;
+            kprintf("%s (%d lines, %u chars)\n", rem, lines, (unsigned)sz);
+        }
         printn = 1;
     }
     if (!printn)
@@ -316,7 +383,10 @@ static void cmd_ls(int argc, char **argv) {
             cmd_ls_list_dir(argv[i]);
         } else if (fs_exists(argv[i])) {
             size_t sz = fs_size(argv[i]);
-            kprintf("%s (%u bytes)\n", argv[i], (unsigned)sz);
+            static char lbuf[INPUT_SIZE];
+            int n = fs_read(argv[i], lbuf, sizeof(lbuf));
+            int lines = (n > 0) ? count_lines(lbuf, n) : 0;
+            kprintf("%s (%d lines, %u chars)\n", argv[i], lines, (unsigned)sz);
         } else {
             kprintf("list: '%s': no such file or directory\n", argv[i]);
         }
@@ -325,15 +395,51 @@ static void cmd_ls(int argc, char **argv) {
 
 static void cmd_cat(int argc, char **argv, const char *in_data, int in_present) {
     static char buf[INPUT_SIZE];
-    if (argc == 1) {
+    int start = 1, end = 0, have_range = 0;
+    int nargs = argc;
+    if (nargs > 1) {
+        int a = 0, b = 0;
+        if (nargs >= 4 && parse_lineno(argv[nargs - 2], &a) &&
+            parse_lineno(argv[nargs - 1], &b)) {
+            if (nargs > 3 || in_present) {
+                start = a;
+                end = b;
+                nargs -= 2;
+                have_range = 1;
+            }
+        } else if (nargs >= 3 && parse_lineno(argv[nargs - 1], &a)) {
+            if (nargs > 2 || in_present) {
+                start = a;
+                end = a; 
+                nargs -= 1;
+                have_range = 1;
+            }
+        }
+        if (have_range && end != 0 && end < start) {
+            kprintf("print: invalid range %d-%d (end < start)\n", start, end);
+            return;
+        }
+    }
+    if (nargs == 1) {
         if (in_present) {
-            print_with_nl(in_data);
+            if (have_range) {
+                int total = 0;
+                int got = print_lines_range(in_data, strlen(in_data), start, end, &total);
+                if (got == 0) {
+                    if (end == start)
+                        kprintf("print: no line %d (input has %d lines)\n", start, total);
+                    else
+                        kprintf("print: no lines %d-%d (input has %d lines)\n", start, end, total);
+                }
+            } else
+                print_with_nl(in_data);
         } else {
-            kprintf("usage: print <file...>  (try 'list', glob '*.txt', or 'print < file')\n");
+            kprintf("usage: print <file...> [start [end]]\n");
+            kprintf("  e.g. print f.txt 5 8  (lines 5-8)\n");
         }
         return;
     }
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < nargs; i++) {
         if (has_glob(argv[i])) {
             kprintf("print: no matches: '%s'\n", argv[i]);
             continue;
@@ -347,26 +453,190 @@ static void cmd_cat(int argc, char **argv, const char *in_data, int in_present) 
             kprintf("print: '%s': no such file\n", argv[i]);
             continue;
         }
-        kprintf("%s", buf);
-        if (n > 0 && buf[n - 1] != '\n')
-            kprintf("\n");
+        if (have_range) {
+            int total = 0;
+            int got = print_lines_range(buf, n, start, end, &total);
+            if (got == 0) {
+                if (end == start)
+                    kprintf("print: '%s': no line %d (file has %d lines)\n", argv[i], start, total);
+                else
+                    kprintf("print: '%s': no lines %d-%d (file has %d lines)\n", argv[i], start, end, total);
+            }
+        } else {
+            kprintf("%s", buf);
+            if (n > 0 && buf[n - 1] != '\n')
+                kprintf("\n");
+        }
     }
 }
 
 
+static void cmd_type_one(const char *label, const char *buf, int n, const char *path_for_ext);
+
+typedef struct {
+    unsigned char magic[8];
+    int magic_len;
+    const char *desc;
+} type_magic_t;
+
+static const type_magic_t type_magics[] = {
+    { { 0x7F, 'E', 'L', 'F' }, 4, "ELF executable" },
+    { { 'M', 'Z' }, 2, "DOS/PE executable" },
+    { { '#', '!' }, 2, "script" },
+    { { '%', 'P', 'D', 'F' }, 4, "PDF document" },
+    { { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A }, 8, "PNG image" },
+    { { 0xFF, 0xD8, 0xFF }, 3, "JPEG image" },
+    { { 'G', 'I', 'F', '8', '7', 'a' }, 6, "GIF image" },
+    { { 'G', 'I', 'F', '8', '9', 'a' }, 6, "GIF image" },
+    { { 'B', 'M' }, 2, "BMP image" },
+    { { 'P', 'K', 0x03, 0x04 }, 4, "ZIP archive" },
+    { { 0x1F, 0x8B }, 2, "gzip compressed" },
+};
+#define TYPE_NUM_MAGICS (sizeof(type_magics) / sizeof(type_magics[0]))
+
+typedef struct {
+    const char *ext;
+    const char *desc;
+} type_ext_t;
+
+static const type_ext_t type_exts[] = {
+    { "txt", "ASCII text (by extension)" },
+    { "log", "ASCII text (by extension)" },
+    { "md", "ASCII text (by extension)" },
+    { "cfg", "ASCII text (by extension)" },
+    { "c", "ASCII text (by extension)" },
+    { "h", "ASCII text (by extension)" },
+    { "s", "ASCII text (by extension)" },
+    { "asm", "ASCII text (by extension)" },
+    { "sh", "ASCII text (by extension)" },
+    { "lst", "ASCII text (by extension)" },
+    { "png", "PNG image (by extension)" },
+    { "jpg", "JPEG image (by extension)" },
+    { "jpeg", "JPEG image (by extension)" },
+    { "gif", "GIF image (by extension)" },
+    { "bmp", "BMP image (by extension)" },
+    { "pdf", "PDF document (by extension)" },
+    { "zip", "ZIP archive (by extension)" },
+    { "gz", "gzip compressed (by extension)" },
+    { "tgz", "gzip compressed (by extension)" },
+    { "elf", "data (by extension)" },
+    { "bin", "data (by extension)" },
+    { "img", "data (by extension)" },
+    { "iso", "data (by extension)" },
+    { "o", "data (by extension)" },
+};
+#define TYPE_NUM_EXTS (sizeof(type_exts) / sizeof(type_exts[0]))
+
+static const char *type_ext_fallback(const char *path) {
+    if (!path)
+        return 0;
+    const char *dot = 0;
+    for (const char *p = path; *p; p++)
+        if (*p == '.')
+            dot = p;
+    if (!dot || !dot[1])
+        return 0;
+    const char *slash = 0;
+    for (const char *p = path; *p; p++)
+        if (*p == '/')
+            slash = p;
+    if (slash && dot < slash)
+        return 0;
+    dot++;
+    for (size_t i = 0; i < TYPE_NUM_EXTS; i++)
+        if (!strcmp(dot, type_exts[i].ext))
+            return type_exts[i].desc;
+    return 0;
+}
+
+static int type_is_text(const char *buf, int n) {
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c == '\n' || c == '\r' || c == '\t' || c == '\f' || c == '\b')
+            continue;
+        if (c >= 32 && c < 127)
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static const char *type_by_header(const char *buf, int n) {
+    for (size_t i = 0; i < TYPE_NUM_MAGICS; i++) {
+        int len = type_magics[i].magic_len;
+        if (n < len)
+            continue;
+        int match = 1;
+        for (int j = 0; j < len; j++) {
+            if ((unsigned char)buf[j] != type_magics[i].magic[j]) {
+                match = 0;
+                break;
+            }
+        }
+        if (match)
+            return type_magics[i].desc;
+    }
+    return 0;
+}
+
+static void cmd_type_one(const char *label, const char *buf, int n, const char *path_for_ext) {
+    const char *t = 0;
+    if (n == 0)
+        t = "empty";
+    else
+        t = type_by_header(buf, n);
+    if (!t) {
+        if (n > 0 && type_is_text(buf, n))
+            t = "ASCII text";
+        else if (n > 0) {
+            const char *ext = type_ext_fallback(path_for_ext);
+            t = ext ? ext : "data";
+        }
+    }
+    kprintf("%s: %s\n", label, t ? t : "data");
+}
+
+static void cmd_type(int argc, char **argv, const char *in_data, int in_present) {
+    static char buf[INPUT_SIZE];
+    if (argc == 1) {
+        if (in_present) {
+            cmd_type_one("<stdin>", in_data, (int)strlen(in_data), 0);
+        } else {
+            kprintf("usage: type <file...> | type < file\n");
+        }
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (has_glob(argv[i])) {
+            kprintf("type: no matches: '%s'\n", argv[i]);
+            continue;
+        }
+        if (fs_is_dir(argv[i])) {
+            kprintf("%s: directory\n", argv[i]);
+            continue;
+        }
+        int n = fs_read(argv[i], buf, sizeof(buf));
+        if (n < 0) {
+            kprintf("type: '%s': no such file\n", argv[i]);
+            continue;
+        }
+        cmd_type_one(argv[i], buf, n, argv[i]);
+    }
+}
+
 static void cmd_help(void) {
     kprintf("commands:\n");
     kprintf(" General: help sysinfo man echo clear ticks beep\n\n");
-    kprintf(" Files: create mkdir list print remove\n\n");
+    kprintf(" Files: create mkdir list print remove edit type\n\n");
     kprintf(" Redirection: echo hello > f.txt | echo more >> f.txt | print < f.txt\n\n");
-    kprintf(" Globbing: * matches any run, ? matches one char  (e.g. list *.txt)\n\n");
-    kprintf(" Chaining: cmd1 ; cmd2 ; cmd3  (e.g. echo hi ; ticks)\n\n");
+    kprintf(" Globbing: * matches any run, ? matches one char\n\n");
+    kprintf(" Chaining: cmd1 ; cmd2 ; cmd3\n\n");
 }
 
 static void man_overview(void) {
     kprintf("MAN - view manual (usage: man <command>)\n\n");
     kprintf("Commands: help sysinfo man echo clear ticks beep\n");
-    kprintf("          create mkdir list print remove\n");
+    kprintf("          create mkdir list print remove edit type\n");
     kprintf("Topics: redirection globbing chaining\n");
     kprintf("Try: man echo ; man list ; man redirection\n");
 }
@@ -377,26 +647,22 @@ static void man_for(const char *topic) {
         kprintf("SYNOPSIS: help\n");
         kprintf("DESC: Lists commands, redir, glob, chain hints.\n");
         kprintf("EXAMPLE: help\n");
-        kprintf("SEE ALSO: man <cmd> for details\n");
     } else if (!strcmp(topic, "sysinfo")) {
         kprintf("SYSINFO - system information\n\n");
         kprintf("SYNOPSIS: sysinfo\n");
         kprintf("DESC: Prints OS, CPU, memory, uptime (like fastfetch).\n");
         kprintf("EXAMPLE: sysinfo | sysinfo > info.txt\n");
-        kprintf("SEE ALSO: man ticks\n");
     } else if (!strcmp(topic, "man")) {
         kprintf("MAN - read manuals\n\n");
         kprintf("SYNOPSIS: man [command|topic]\n");
         kprintf("DESC: No args lists topics. With arg shows that page.\n");
         kprintf("EXAMPLES: man | man echo | man redirection\n");
-        kprintf("SEE ALSO: help\n");
     } else if (!strcmp(topic, "echo")) {
         kprintf("ECHO - print text\n\n");
         kprintf("SYNOPSIS: echo [text...] | echo < file\n");
         kprintf("DESC: Prints args joined by spaces. Bare echo prints\n");
         kprintf("  blank line; with '< file' prints file (stdin redir).\n");
         kprintf("EXAMPLES: echo hi | echo hi > a.txt | echo \"*\"\n");
-        kprintf("SEE ALSO: man redirection\n");
     } else if (!strcmp(topic, "clear")) {
         kprintf("CLEAR - clear screen\n\n");
         kprintf("SYNOPSIS: clear\n");
@@ -407,62 +673,73 @@ static void man_for(const char *topic) {
         kprintf("SYNOPSIS: ticks\n");
         kprintf("DESC: Prints PIT ticks since boot (100 ticks = 1 sec).\n");
         kprintf("EXAMPLE: ticks\n");
-        kprintf("SEE ALSO: sysinfo\n");
     } else if (!strcmp(topic, "beep")) {
         kprintf("BEEP - PC speaker beep\n\n");
         kprintf("SYNOPSIS: beep\n");
         kprintf("DESC: Plays a short beep, then prints 'beep!'.\n");
         kprintf("EXAMPLE: beep\n");
     } else if (!strcmp(topic, "create")) {
-        kprintf("CREATE(1) - create files\n");
+        kprintf("CREATE - create files\n");
         kprintf("SYNOPSIS: create <file...>\n");
         kprintf("DESC: Creates empty file(s). Existing files kept.\n");
         kprintf("  Dirs error if path is a directory.\n");
         kprintf("EXAMPLE: create hi.txt ; echo hi > hi.txt\n");
-        kprintf("SEE ALSO: mkdir list print remove\n");
     } else if (!strcmp(topic, "mkdir")) {
-        kprintf("MKDIR(1) - make directories\n");
+        kprintf("MKDIR - make directories\n");
         kprintf("SYNOPSIS: mkdir <dir...>\n");
         kprintf("DESC: Creates dir(s). Use paths like docs/ or a/b.\n");
         kprintf("EXAMPLE: mkdir docs ; list\n");
-        kprintf("SEE ALSO: create list remove\n");
     } else if (!strcmp(topic, "list") || !strcmp(topic, "ls")) {
-        kprintf("LIST(1) - list files\n");
+        kprintf("LIST - list files\n");
         kprintf("SYNOPSIS: list [path...]  (bare list = top level)\n");
         kprintf("DESC: Lists files or dir contents. Globs expand before\n");
         kprintf("  lookup; unmatched glob prints 'no matches'.\n");
         kprintf("EXAMPLES: list | list docs | list *.txt\n");
-        kprintf("SEE ALSO: print remove\n");
     } else if (!strcmp(topic, "print") || !strcmp(topic, "cat")) {
-        kprintf("PRINT(1) - print files\n");
-        kprintf("SYNOPSIS: print <file...> | print < file\n");
+        kprintf("PRINT - print files\n");
+        kprintf("SYNOPSIS: print <file...> [start [end]] | print < file\n");
         kprintf("DESC: Prints file(s). Bare print shows usage; dirs\n");
         kprintf("  error; missing files error per file.\n");
+        kprintf("  start/end are 1-based line numbers: 'print a.txt\n");
+        kprintf("  5 8' prints lines 5-8, 'print a.txt 5' prints\n");
+        kprintf("  line 5 only.\n");
         kprintf("EXAMPLES: print a.txt | print *.txt | print < a.txt\n");
-        kprintf("SEE ALSO: list man redirection\n");
+        kprintf("  print a.txt 5 8 | print a.txt 5\n");
     } else if (!strcmp(topic, "remove") || !strcmp(topic, "rm")) {
-        kprintf("REMOVE(1) - delete files\n");
+        kprintf("REMOVE - delete files\n");
         kprintf("SYNOPSIS: remove <path...>\n");
         kprintf("DESC: Deletes files/dirs. Dirs must be empty.\n");
         kprintf("EXAMPLES: remove a.txt | remove *.log\n");
-        kprintf("SEE ALSO: create mkdir list\n");
-    } else if (!strcmp(topic, "redirection") || !strcmp(topic, "redir") ||
-               !strcmp(topic, ">") || !strcmp(topic, "redirect")) {
+    } else if (!strcmp(topic, "edit")) {
+        kprintf("EDIT - nano-like text editor\n\n");
+        kprintf("SYNOPSIS: edit <file>\n");
+        kprintf("DESC: Full-screen editor. Creates file if missing.\n");
+        kprintf("  Arrows move, Home/End line, PgUp/PgDn scroll.\n");
+        kprintf("  ^O save, ^X (or ESC) exit, ^K cut, ^U paste.\n");
+        kprintf("  Scrolls; status bar shows line/col.\n");
+        kprintf("EXAMPLE: edit notes.txt\n");
+    } else if (!strcmp(topic, "type")) {
+        kprintf("TYPE - identify file type\n\n");
+        kprintf("SYNOPSIS: type <file...> | type < file\n");
+        kprintf("DESC: Inspects file header (ELF, PNG, JPEG, GIF,\n");
+        kprintf("  BMP, ZIP, gzip, PDF, MZ, #! script). Text without\n");
+        kprintf("  header prints ASCII text; binary without header\n");
+        kprintf("  prints data or uses the file extension.\n");
+        kprintf("EXAMPLES: type a.txt | type *.bin | type < a.txt\n");
+    } else if (!strcmp(topic, "redirection") || !strcmp(topic, "redir") || !strcmp(topic, ">") || !strcmp(topic, "redirect")) {
         kprintf("REDIRECTION - file redirect (< > >>)\n");
         kprintf("SYNOPSIS: cmd > f | cmd >> f | cmd < f\n");
         kprintf("DESC: > creates/overwrites, >> appends, < feeds file\n");
         kprintf("  as stdin. Any command output can redirect.\n");
         kprintf("EXAMPLES: echo hi > a.txt | sysinfo > i.txt\n");
         kprintf("  echo more >> a.txt | print < a.txt\n");
-    } else if (!strcmp(topic, "globbing") || !strcmp(topic, "glob") ||
-               !strcmp(topic, "*") || !strcmp(topic, "wildcard")) {
+    } else if (!strcmp(topic, "globbing") || !strcmp(topic, "glob") || !strcmp(topic, "*") || !strcmp(topic, "wildcard")) {
         kprintf("GLOBBING - wildcards (* ?)\n");
         kprintf("SYNOPSIS: list *.txt | print docs/*.txt\n");
         kprintf("DESC: * matches any run, ? matches one char.\n");
         kprintf("  Only after command word. Quote to suppress.\n");
         kprintf("EXAMPLES: list *.txt | echo \"*\"\n");
-    } else if (!strcmp(topic, "chaining") || !strcmp(topic, "chain") ||
-               !strcmp(topic, ";")) {
+    } else if (!strcmp(topic, "chaining") || !strcmp(topic, "chain") || !strcmp(topic, ";")) {
         kprintf("CHAINING - run commands in order (;)\n");
         kprintf("SYNOPSIS: cmd1 ; cmd2 ; cmd3\n");
         kprintf("DESC: ';' splits commands. ';' in quotes or as \\;\n");
@@ -483,8 +760,8 @@ static void cmd_man(int argc, char **argv) {
         man_for(argv[i]);
 }
 
-static void shell_exec(int argc, char **argv, const char *in_data,
-                       size_t in_len, int in_present) {
+
+static void shell_exec(int argc, char **argv, const char *in_data, size_t in_len, int in_present) {
     (void)in_len;
     if (argc <= 0)
         return;
@@ -550,6 +827,8 @@ static void shell_exec(int argc, char **argv, const char *in_data,
         cmd_ls(argc, argv);
     } else if (!strcmp(cmd, "print")) {
         cmd_cat(argc, argv, in_data, in_present);
+    } else if (!strcmp(cmd, "type")) {
+        cmd_type(argc, argv, in_data, in_present);
     } else if (!strcmp(cmd, "remove")) {
         if (argc < 2) {
             kprintf("usage: remove <file...>\n");
@@ -563,6 +842,14 @@ static void shell_exec(int argc, char **argv, const char *in_data,
                     kprintf("remove: cannot remove '%s' (dir not empty?)\n", argv[i]);
                 }
             }
+        }
+    } else if (!strcmp(cmd, "edit")) {
+        if (argc < 2) {
+            kprintf("usage: edit <file>\n");
+        } else if (argc > 2) {
+            kprintf("edit: too many arguments (usage: edit <file>)\n");
+        } else {
+            editor_open(argv[1]);
         }
     } else {
         kprintf("unknown command: '%s' (try help)\n", cmd);
@@ -673,8 +960,7 @@ void shell_run(void) {
                 continue;
 
             int append = 0;
-            int pr = parse_redir(argc, argv, qflags, argv2, qflags2, in_file, out_file,
-                                 &append);
+            int pr = parse_redir(argc, argv, qflags, argv2, qflags2, in_file, out_file, &append);
             if (pr < 0) {
                 kprintf("syntax error: redirection needs a filename (e.g. echo hi > f.txt)\n");
                 continue;
@@ -718,11 +1004,11 @@ void shell_run(void) {
                 size_t n = kprintf_end_capture();
                 cap[n] = 0;
                 if (fs_write(out_file, cap, n, append) != 0)
-                    kprintf("redirection failed: cannot write '%s' (too big? bad name?)\n",
-                            out_file);
+                    kprintf("redirection failed: cannot write '%s' (too big? bad name?)\n", out_file);
                 else if (n + 1 >= sizeof(cap))
                     kprintf("warning: output truncated to %d bytes\n", CAP_SIZE - 1);
             }
         }
     }
 }
+

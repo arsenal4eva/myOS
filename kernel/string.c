@@ -36,8 +36,13 @@ void *memset(void *d, int c, size_t n) {
     for (size_t i = 0; i < n; i++) p[i] = (uint8_t)c;
     return d;
 }
-void *memmove(void *d, const void *s, size_t n) {
-    uint8_t *dd = d; const uint8_t *ss = s;
+char *strcat(char *d, const char *s) {
+    char *o = d;
+    while (*d) d++;
+    while ((*d++ = *s++));
+    return o;
+}
+void *memmove(void *d, const void *s, size_t n) {    uint8_t *dd = d; const uint8_t *ss = s;
     if (dd < ss) { for (size_t i = 0; i < n; i++) dd[i] = ss[i]; }
     else { for (size_t i = n; i > 0; i--) dd[i-1] = ss[i-1]; }
     return d;
